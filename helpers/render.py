@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
-    from grade import get_preset, auto_grade_for_clip  # same directory
+    from grade import get_preset, auto_grade_for_clip, analyze_segments_consistent  # same directory
 except Exception:
     def get_preset(name: str) -> str:
         return ""
@@ -37,23 +39,25 @@ except Exception:
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
 
+    def analyze_segments_consistent(segments, verbose=False):  # type: ignore
+        return "eq=contrast=1.03:saturation=0.98"
 
-# -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
-#
-# MarginV is NOT taste — it is a platform safe-zone rule.
-# TikTok / IG Reels / Shorts UI (caption, username, music, right-rail actions)
-# covers roughly the bottom ~25–30% of a 1080×1920 frame. Captions placed near
-# the bottom edge get clipped or obscured by the UI. libass auto-scales the
-# render canvas relative to PlayResY=288, so MarginV=90 lands the caption
-# baseline roughly 30% up from the bottom on any aspect — clear of the UI on
-# every major vertical-video platform. Do not drop this below ~75 without a
-# specific reason.
-SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
-    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-    "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
-)
+try:
+    from subtitles import build_master_srt, get_force_style  # same directory
+except Exception:
+    def get_force_style(style: str) -> str:  # type: ignore
+        return (
+            "FontName=Helvetica,FontSize=18,Bold=1,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
+            "BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=90"
+        )
+
+    def build_master_srt(edl, edit_dir, out_path, style=None):  # type: ignore
+        raise RuntimeError("subtitles module not available")
+
+
+# Default subtitle style — overridden by EDL `subtitle_style` via subtitles.py
+SUB_FORCE_STYLE = get_force_style("bold-overlay")
 
 # -------- Helpers ------------------------------------------------------------
 
@@ -68,12 +72,12 @@ def resolve_grade_filter(grade_field: str | None) -> str:
     """The EDL's 'grade' field can be a preset name, a raw ffmpeg filter, or 'auto'.
 
     Returns the filter string to embed into the per-segment -vf chain.
-    For 'auto', returns the sentinel "__AUTO__" which is resolved per-segment.
+    For 'auto' / 'auto_consistent', returns a sentinel resolved per-segment or once.
     """
     if not grade_field:
         return ""
-    if grade_field == "auto":
-        return "__AUTO__"
+    if grade_field in ("auto", "auto_consistent"):
+        return f"__{grade_field.upper()}__"
     # Preset names are short identifiers, filter strings contain '=' or ','.
     if re.fullmatch(r"[a-zA-Z0-9_\-]+", grade_field):
         try:
@@ -90,6 +94,104 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     if p.is_absolute():
         return p
     return (base / p).resolve()
+
+
+def flatten_edl(edl: dict, edit_dir: Path) -> tuple[dict, list[dict], list[dict]]:
+    """Merge intro/outro into flat ranges; collect music-replace sections + title specs.
+
+    Returns (normalized_edl, music_sections, title_specs).
+    music_sections: [{from_output, to_output, file, music_start, volume}]
+    title_specs: [{text, subtitle, at_output, duration}]
+    """
+    edl = json.loads(json.dumps(edl))  # deep copy
+    all_ranges: list[dict] = []
+    music_sections: list[dict] = []
+    title_specs: list[dict] = []
+    offset = 0.0
+
+    def _absorb_section(section: dict | None, section_type: str) -> None:
+        nonlocal offset
+        if not section:
+            return
+
+        # Merge any sources declared in the section block
+        for name, path in (section.get("sources_needed") or {}).items():
+            edl.setdefault("sources", {})[name] = path
+
+        section_ranges = section.get("ranges") or []
+        section_dur = sum(float(r["end"]) - float(r["start"]) for r in section_ranges)
+        if section_dur <= 0:
+            return
+
+        music = section.get("music") or {}
+        if music.get("file"):
+            music_sections.append({
+                "from_output": offset,
+                "to_output": offset + section_dur,
+                "file": music["file"],
+                "music_start": float(music.get("start", 0)),
+                "volume": float(music.get("volume", 1.0)),
+            })
+
+        for t in section.get("titles") or []:
+            title_specs.append({
+                "text": t["text"],
+                "subtitle": t.get("subtitle"),
+                "at_output": offset + float(t.get("at", 0)),
+                "duration": float(t.get("duration", 1.5)),
+            })
+
+        for r in section_ranges:
+            rr = dict(r)
+            rr["type"] = rr.get("type", section_type)
+            rr["_section"] = section_type
+            all_ranges.append(rr)
+        offset += section_dur
+
+    _absorb_section(edl.pop("intro", None), "intro")
+
+    for r in edl.get("ranges") or []:
+        all_ranges.append(r)
+        offset += float(r["end"]) - float(r["start"])
+
+    _absorb_section(edl.pop("outro", None), "outro")
+
+    edl["ranges"] = all_ranges
+    return edl, music_sections, title_specs
+
+
+def generate_title_overlays(title_specs: list[dict], edit_dir: Path) -> list[dict]:
+    """Render title card MP4s and return overlay dicts for the compositor."""
+    if not title_specs:
+        return []
+
+    try:
+        from title_card import render_title_video
+    except ImportError:
+        print("warning: title_card module not available, skipping title renders")
+        return []
+
+    titles_dir = edit_dir / "titles"
+    titles_dir.mkdir(parents=True, exist_ok=True)
+    overlays: list[dict] = []
+
+    for i, t in enumerate(title_specs):
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", t["text"][:30])
+        out = titles_dir / f"title_{i:02d}_{safe}.mp4"
+        render_title_video(
+            title=t["text"],
+            out_path=out,
+            duration=t["duration"],
+            subtitle=t.get("subtitle"),
+        )
+        overlays.append({
+            "file": str(out.relative_to(edit_dir)),
+            "start_in_output": t["at_output"],
+            "duration": t["duration"],
+        })
+        print(f"  title card: \"{t['text']}\" @ {t['at_output']:.2f}s")
+
+    return overlays
 
 
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------
@@ -157,6 +259,7 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    mute_audio: bool = False,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -186,7 +289,10 @@ def extract_segment(
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    if mute_audio:
+        af = "volume=0"
+    else:
+        af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -211,11 +317,62 @@ def extract_segment(
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+def _extract_one_segment(
+    i: int,
+    r: dict,
+    sources: dict,
+    edit_dir: Path,
+    resolved: str,
+    is_auto: bool,
+    consistent_filter: str,
+    clips_dir: Path,
+    preview: bool,
+    draft: bool,
+) -> tuple[int, Path]:
+    """Worker for parallel segment extraction. Returns (index, path)."""
+    src_name = r["source"]
+    src_path = resolve_path(sources[src_name], edit_dir)
+    start = float(r["start"])
+    end = float(r["end"])
+    duration = end - start
+    out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
+
+    if consistent_filter:
+        seg_filter = consistent_filter
+    elif is_auto:
+        seg_filter, _ = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
+    else:
+        seg_filter = resolved
+
+    # Meme/insert/broll/intro/outro audio handling
+    seg_type = r.get("type", "take")
+    mute = False
+    if seg_type in ("intro", "outro"):
+        mute = True  # music-led — source audio always muted
+    elif seg_type in ("meme", "insert", "broll"):
+        keep_audio = r.get("keep_audio")
+        if keep_audio is True:
+            mute = False
+        elif keep_audio is False:
+            mute = True
+        elif seg_type == "broll":
+            mute = True
+        else:
+            mute = False  # memes: keep audio (sound memes are the point)
+
+    extract_segment(
+        src_path, start, duration, seg_filter, out_path,
+        preview=preview, draft=draft, mute_audio=mute,
+    )
+    return i, out_path
+
+
 def extract_all_segments(
     edl: dict,
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    workers: int | None = None,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -226,6 +383,7 @@ def extract_all_segments(
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    is_auto_consistent = resolved == "__AUTO_CONSISTENT__"
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -234,31 +392,57 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
 
-    seg_paths: list[Path] = []
-    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    # Pre-compute one unified grade for auto_consistent mode
+    consistent_filter = ""
+    if is_auto_consistent:
+        segs = []
+        for r in ranges:
+            src_path = resolve_path(sources[r["source"]], edit_dir)
+            segs.append((src_path, float(r["start"]), float(r["end"]) - float(r["start"])))
+        consistent_filter = analyze_segments_consistent(segs, verbose=True)
+        print(f"  consistent grade: {consistent_filter or '(none)'}")
+
+    if workers is None:
+        workers = min(4, max(1, (os.cpu_count() or 4) // 2))
+
+    seg_paths: list[Path | None] = [None] * len(ranges)
+    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/ ({workers} workers)")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
-    for i, r in enumerate(ranges):
-        src_name = r["source"]
-        src_path = resolve_path(sources[src_name], edit_dir)
-        start = float(r["start"])
-        end = float(r["end"])
-        duration = end - start
-        out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
-        if is_auto:
-            seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
-        else:
-            seg_filter = resolved
+    if workers <= 1 or len(ranges) == 1:
+        for i, r in enumerate(ranges):
+            note = r.get("beat") or r.get("note") or ""
+            start, end = float(r["start"]), float(r["end"])
+            print(f"  [{i:02d}] {r['source']}  {start:7.2f}-{end:7.2f}  ({end-start:5.2f}s)  {note}")
+            _, path = _extract_one_segment(
+                i, r, sources, edit_dir, resolved, is_auto, consistent_filter,
+                clips_dir, preview, draft,
+            )
+            seg_paths[i] = path
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _extract_one_segment,
+                    i, r, sources, edit_dir, resolved, is_auto, consistent_filter,
+                    clips_dir, preview, draft,
+                ): (i, r)
+                for i, r in enumerate(ranges)
+            }
+            for fut in as_completed(futures):
+                i, r = futures[fut]
+                try:
+                    idx, path = fut.result()
+                    note = r.get("beat") or r.get("note") or ""
+                    start, end = float(r["start"]), float(r["end"])
+                    print(f"  [{idx:02d}] {r['source']}  {start:7.2f}-{end:7.2f}  ({end-start:5.2f}s)  {note}")
+                    seg_paths[idx] = path
+                except Exception as e:
+                    print(f"  [{i:02d}] FAILED: {e}")
+                    raise
 
-        note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
-        if is_auto:
-            print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
-        seg_paths.append(out_path)
-
-    return seg_paths
+    return [p for p in seg_paths if p is not None]
 
 
 # -------- Lossless concat ----------------------------------------------------
@@ -283,108 +467,134 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
     concat_list.unlink(missing_ok=True)
 
 
-# -------- Master SRT (Rule 5) ------------------------------------------------
+# -------- Music bed mixing ---------------------------------------------------
 
 
-PUNCT_BREAK = set(".,!?;:")
+def mix_music_bed(
+    base_path: Path,
+    music_spec: dict,
+    edit_dir: Path,
+    out_path: Path,
+    preview: bool = False,
+) -> None:
+    """Mix a background music track under the base video with optional ducking.
 
-
-def _srt_timestamp(seconds: float) -> str:
-    total_ms = int(round(seconds * 1000))
-    h, rem = divmod(total_ms, 3600_000)
-    m, rem = divmod(rem, 60_000)
-    s, ms = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict]:
-    out: list[dict] = []
-    for w in transcript.get("words", []):
-        if w.get("type") != "word":
-            continue
-        ws = w.get("start")
-        we = w.get("end")
-        if ws is None or we is None:
-            continue
-        if we <= t_start or ws >= t_end:
-            continue
-        out.append(w)
-    return out
-
-
-def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
-    """Build an output-timeline SRT from per-source transcripts.
-
-    - 2-word chunks (break on any punctuation in between)
-    - UPPERCASE text
-    - Output times computed as word.start - segment_start + segment_offset
+    music_spec keys:
+      file          — path to audio (mp3/wav/m4a)
+      volume        — music level 0.0-1.0 (default 0.22)
+      start_at      — when music starts in output timeline (default 0)
+      fade_in       — seconds (default 1.0)
+      fade_out      — seconds (default 2.0)
+      duck_on_speech — lower music under dialogue (default true)
     """
-    transcripts_dir = edit_dir / "transcripts"
-    sources = edl["sources"]
+    music_path = resolve_path(music_spec["file"], edit_dir)
+    if not music_path.exists():
+        print(f"warning: music file not found: {music_path}")
+        run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
+        return
 
-    entries: list[tuple[float, float, str]] = []
-    seg_offset = 0.0
+    volume = float(music_spec.get("volume", 0.22))
+    fade_in = float(music_spec.get("fade_in", 1.0))
+    fade_out = float(music_spec.get("fade_out", 2.0))
+    duck = music_spec.get("duck_on_speech", True)
 
-    for r in edl["ranges"]:
-        src_name = r["source"]
-        seg_start = float(r["start"])
-        seg_end = float(r["end"])
-        seg_duration = seg_end - seg_start
+    # Probe base duration
+    dur_out = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(base_path)],
+        stderr=subprocess.DEVNULL,
+    )
+    duration = float(dur_out.decode().strip())
+    fade_out_start = max(0.0, duration - fade_out)
 
-        tr_path = transcripts_dir / f"{src_name}.json"
-        if not tr_path.exists():
-            print(f"  no transcript for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration
-            continue
+    # Loop/trim music to match video length, apply volume + fades
+    music_chain = (
+        f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{duration:.3f},"
+        f"volume={volume},"
+        f"afade=t=in:st=0:d={fade_in},"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out}[music]"
+    )
 
-        transcript = json.loads(tr_path.read_text())
-        words_in_seg = _words_in_range(transcript, seg_start, seg_end)
+    if duck:
+        # Sidechain compress music against dialogue — music dips when speech is loud
+        filter_complex = (
+            f"{music_chain};"
+            f"[0:a][music]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=200:makeup=1[ducked];"
+            f"[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        )
+    else:
+        filter_complex = f"{music_chain};[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
 
-        # Group into 2-word chunks, break on punctuation
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        for w in words_in_seg:
-            text = (w.get("text") or "").strip()
-            if not text:
-                continue
-            current.append(w)
-            # Break if the current text ends in punctuation or we hit 2 words
-            ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
-            if len(current) >= 2 or ends_in_punct:
-                chunks.append(current)
-                current = []
-        if current:
-            chunks.append(current)
-
-        for chunk in chunks:
-            local_start = max(seg_start, chunk[0].get("start", seg_start))
-            local_end = min(seg_end, chunk[-1].get("end", seg_end))
-            out_start = max(0.0, local_start - seg_start) + seg_offset
-            out_end = max(0.0, local_end - seg_start) + seg_offset
-            if out_end <= out_start:
-                out_end = out_start + 0.4
-            text = " ".join((w.get("text") or "").strip() for w in chunk)
-            text = re.sub(r"\s+", " ", text).strip()
-            # Strip trailing punctuation for cleaner uppercase look
-            text = text.rstrip(",;:")
-            text = text.upper()
-            entries.append((out_start, out_end, text))
-
-        seg_offset += seg_duration
-
-    # Sort and write as SRT
-    entries.sort(key=lambda e: e[0])
-    lines: list[str] = []
-    for i, (a, b, t) in enumerate(entries, start=1):
-        lines.append(str(i))
-        lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
-        lines.append(t)
-        lines.append("")
-    out_path.write_text("\n".join(lines))
-    print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "-i", str(base_path),
+        "-i", str(music_path),
+        "-filter_complex", filter_complex,
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    print(f"music mix → {out_path.name} (vol={volume}, duck={'on' if duck else 'off'})")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-# -------- Loudness normalization (social-ready audio) -----------------------
+def apply_music_sections(
+    base_path: Path,
+    music_sections: list[dict],
+    edit_dir: Path,
+    out_path: Path,
+) -> None:
+    """Replace audio in intro/outro sections with music slices (source video muted there)."""
+    if not music_sections:
+        run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
+        return
+
+    mute_expr = "1"
+    for sec in sorted(music_sections, key=lambda s: s["from_output"], reverse=True):
+        f, t = sec["from_output"], sec["to_output"]
+        mute_expr = f"if(between(t,{f:.3f},{t:.3f}),0,{mute_expr})"
+
+    inputs = ["-i", str(base_path)]
+    filter_parts = [f"[0:a]volume='{mute_expr}':eval=frame[basea]"]
+    mix_labels = ["[basea]"]
+
+    for i, sec in enumerate(music_sections):
+        music_path = resolve_path(sec["file"], edit_dir)
+        inputs += ["-i", str(music_path)]
+        sec_dur = sec["to_output"] - sec["from_output"]
+        delay_ms = int(sec["from_output"] * 1000)
+        vol = sec.get("volume", 1.0)
+        mstart = sec.get("music_start", 0)
+        label = f"[m{i}]"
+        filter_parts.append(
+            f"[{i + 1}:a]atrim=start={mstart:.3f}:duration={sec_dur:.3f},"
+            f"asetpts=PTS-STARTPTS,volume={vol},"
+            f"adelay={delay_ms}|{delay_ms}{label}"
+        )
+        mix_labels.append(label)
+
+    n_inputs = len(mix_labels)
+    filter_parts.append(
+        f"{''.join(mix_labels)}amix=inputs={n_inputs}:duration=first:dropout_transition=0:normalize=0[aout]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        *inputs,
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    print(f"music sections → {out_path.name} ({len(music_sections)} section(s), replace mode)")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+# -------- Final compositing (Rule 1 + Rule 4) -------------------------------
 
 
 # Social-media standard: -14 LUFS integrated, -1 dBTP peak, LRA 11 LU.
@@ -499,6 +709,7 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    force_style: str | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -536,10 +747,11 @@ def build_final_composite(
         current = next_label
 
     # Subtitles LAST — Rule 1
+    sub_style = force_style or SUB_FORCE_STYLE
     if has_subs:
         subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
         filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
+            f"{current}subtitles='{subs_abs}':force_style='{sub_style}'[outv]"
         )
         out_label = "[outv]"
     else:
@@ -601,6 +813,19 @@ def main() -> None:
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel workers for segment extraction (default: min(4, cpu//2))",
+    )
+    ap.add_argument(
+        "--subtitle-style",
+        type=str,
+        default=None,
+        choices=["bold-overlay", "punch-word", "natural", "comedy"],
+        help="Subtitle style (overrides EDL subtitle_style)",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -611,9 +836,19 @@ def main() -> None:
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
 
+    # Flatten intro/outro blocks, collect music-replace sections + title specs
+    edl, music_sections, title_specs = flatten_edl(edl, edit_dir)
+    if music_sections:
+        print(f"intro/outro: {len(music_sections)} music-led section(s)")
+    if title_specs:
+        print(f"generating {len(title_specs)} title card(s)")
+        title_overlays = generate_title_overlays(title_specs, edit_dir)
+        edl.setdefault("overlays", [])
+        edl["overlays"] = title_overlays + edl["overlays"]
+
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir, preview=args.preview, draft=args.draft, workers=args.workers,
     )
 
     # 2. Concat → base
@@ -626,12 +861,27 @@ def main() -> None:
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
 
-    # 3. Subtitles: build if requested, resolve final path
+    # 2b. Music-led intro/outro sections (replace source audio with music slices)
+    if music_sections:
+        sections_out = edit_dir / base_name.replace(".mp4", "_sections.mp4")
+        apply_music_sections(base_path, music_sections, edit_dir, sections_out)
+        base_path = sections_out
+
+    # 2c. Optional background music bed under dialogue (main body)
+    music_spec = edl.get("music")
+    if music_spec and music_spec.get("file"):
+        music_out = edit_dir / base_name.replace(".mp4", "_music.mp4")
+        mix_music_bed(base_path, music_spec, edit_dir, music_out, preview=args.preview)
+        base_path = music_out
+
+    # 3. Subtitles: build if requested, resolve final path + style
     subs_path: Path | None = None
+    sub_style_name = args.subtitle_style or edl.get("subtitle_style") or "bold-overlay"
+    force_style = get_force_style(sub_style_name)
     if not args.no_subtitles:
         if args.build_subtitles:
             subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            build_master_srt(edl, edit_dir, subs_path, style=sub_style_name)
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
             if not subs_path.exists():
@@ -641,14 +891,16 @@ def main() -> None:
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
     if args.no_loudnorm:
-        # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(
+            base_path, overlays, subs_path, out_path, edit_dir, force_style=force_style,
+        )
     else:
-        # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(
+            base_path, overlays, subs_path, tmp_composite, edit_dir, force_style=force_style,
+        )
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
-        apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
+        apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft or args.preview)
         tmp_composite.unlink(missing_ok=True)
 
     size_mb = out_path.stat().st_size / (1024 * 1024)

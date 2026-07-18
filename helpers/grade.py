@@ -60,6 +60,27 @@ PRESETS: dict[str, str] = {
 
     # Flat — no grade. Useful as a sentinel for "skip grading this source".
     "none": "",
+
+    # Social / comedy — punchy, slightly warm, lifted shadows. Good for vlogs & reaction content.
+    "vibrant_social": (
+        "eq=contrast=1.08:brightness=0.01:saturation=1.06:gamma=0.97,"
+        "curves=master='0/0.02 0.25/0.26 0.75/0.76 1/1'"
+    ),
+
+    # Comedy / podcast — bright, clean, skin-safe. Lifts mids without crushing blacks.
+    "comedy_bright": (
+        "eq=contrast=1.05:brightness=0.02:saturation=1.04:gamma=0.96,"
+        "colorbalance=rs=0.01:gs=0.0:bs=-0.01:rm=0.02:gm=0.01:bm=0.0,"
+        "curves=master='0/0.01 0.5/0.52 1/1'"
+    ),
+
+    # Cool cinematic — subtle teal in shadows, warm highlights. Documentary / travel.
+    "cinematic_cool": (
+        "eq=contrast=1.07:brightness=-0.01:saturation=0.94,"
+        "colorbalance=rs=-0.02:gs=0.0:bs=0.03:rm=-0.01:gm=0.0:bm=0.02:"
+        "rh=0.04:gh=0.01:bh=-0.03,"
+        "curves=master='0/0 0.25/0.24 0.75/0.76 1/1'"
+    ),
 }
 
 
@@ -164,7 +185,10 @@ def _sample_frame_stats(
             if y_maxs and y_mins
             else 0.7
         )
-        sat_mean = ((sum(sat_avgs) / len(sat_avgs)) / max_val) if sat_avgs else 0.25
+        # SATAVG from signalstats is luma-scaled like YAVG (0..max_val), not a 0-1 ratio.
+        # Normalize to approximate saturation intensity 0..1.
+        raw_sat = (sum(sat_avgs) / len(sat_avgs)) if sat_avgs else 0.0
+        sat_mean = min(1.0, raw_sat / max(max_val * 0.35, 1.0))
 
         return {
             "y_mean": y_mean,
@@ -269,6 +293,68 @@ def auto_grade_for_clip(
         print(f"    → filter: {filter_string or '(empty)'}")
 
     return filter_string, stats
+
+
+def analyze_segments_consistent(
+    segments: list[tuple[Path, float, float]],
+    verbose: bool = False,
+) -> str:
+    """Analyze multiple segment ranges and return ONE unified grade filter.
+
+    Averages stats across all segments so the final video doesn't shift color
+    between cuts. Use when EDL grade is "auto_consistent".
+    """
+    if not segments:
+        return get_preset("subtle")
+
+    all_stats: list[dict[str, float]] = []
+    for video, start, duration in segments:
+        _, stats = auto_grade_for_clip(video, start=start, duration=duration, verbose=False)
+        all_stats.append(stats)
+
+    avg_y = sum(s["y_mean"] for s in all_stats) / len(all_stats)
+    avg_range = sum(s["y_std"] * 4.0 for s in all_stats) / len(all_stats)
+    avg_sat = sum(s["sat_mean"] for s in all_stats) / len(all_stats)
+
+    # Re-run decision rules on averaged stats (inline to avoid double probe)
+    contrast_adj = 1.03
+    if avg_range < 0.65:
+        t = max(0.0, min(1.0, (avg_range - 0.50) / 0.15))
+        contrast_adj = 1.08 - 0.05 * t
+
+    gamma_adj = 1.0
+    if avg_y < 0.42:
+        t = max(0.0, min(1.0, (avg_y - 0.30) / 0.12))
+        gamma_adj = 1.10 - 0.08 * t
+    elif avg_y > 0.60:
+        gamma_adj = 0.97
+
+    sat_adj = 0.98
+    if avg_sat < 0.18:
+        sat_adj = 1.04
+    elif avg_sat > 0.38:
+        sat_adj = 0.96
+
+    contrast_adj = max(0.94, min(1.08, contrast_adj))
+    gamma_adj = max(0.94, min(1.10, gamma_adj))
+    sat_adj = max(0.94, min(1.06, sat_adj))
+
+    eq_parts = []
+    if abs(contrast_adj - 1.0) > 0.005:
+        eq_parts.append(f"contrast={contrast_adj:.3f}")
+    if abs(gamma_adj - 1.0) > 0.005:
+        eq_parts.append(f"gamma={gamma_adj:.3f}")
+    if abs(sat_adj - 1.0) > 0.005:
+        eq_parts.append(f"saturation={sat_adj:.3f}")
+
+    filter_string = "eq=" + ":".join(eq_parts) if eq_parts else get_preset("subtle")
+
+    if verbose:
+        print(f"  consistent grade across {len(segments)} segments:")
+        print(f"    avg y_mean={avg_y:.3f}  y_range={avg_range:.3f}  sat={avg_sat:.3f}")
+        print(f"    → {filter_string}")
+
+    return filter_string
 
 
 def apply_grade(input_path: Path, output_path: Path, filter_string: str) -> None:

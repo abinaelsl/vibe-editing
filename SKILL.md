@@ -1,6 +1,6 @@
 ---
-name: video-use
-description: Edit any video by conversation. Transcribe, cut, color grade, generate overlay animations, burn subtitles — for talking heads, montages, tutorials, travel, interviews. No presets, no menus. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+name: vibe-editing
+description: Vibe Editing by @abinaelsl — edit any video by conversation. Transcribe, cut, color grade, meme inserts, music beds, beat-synced intro/outro, overlay animations, smart subtitles. Ask questions, confirm the plan, execute, iterate, persist.
 ---
 
 # Video Use
@@ -40,9 +40,12 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 ```
 <videos_dir>/
-├── <source files, untouched>
+├── <source takes, untouched>
+├── memes/                       ← optional: reaction clips, vine memes, sfx vids
+├── music/                       ← optional: background tracks (.mp3, .wav, .m4a)
 └── edit/
     ├── project.md               ← memory; appended every session
+    ├── inventory.json           ← asset classification (takes / memes / music)
     ├── takes_packed.md          ← phrase-level transcripts, the LLM's primary reading view
     ├── edl.json                 ← cut decisions
     ├── transcripts/<name>.json  ← cached raw Scribe JSON
@@ -71,20 +74,25 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
+- **`inventory.py <videos_dir>`** — classify takes, memes, music, b-roll → `inventory.json`. Run before transcription.
 - **`transcribe.py <video>`** — single-file Scribe call. `--num-speakers N` optional. Cached.
-- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
+- **`transcribe_batch.py <videos_dir>`** — parallel transcription (main takes only; skips memes/music). `--all` to include everything.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
-- **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`beats.py <music>`** — detect BPM + beat timestamps for intro/outro montage cutting.
+- **`build_sequence.py`** — build beat-synced intro/outro EDL blocks from beats + b-roll.
+- **`title_card.py "TEXT" -o title.mp4`** — generate title overlay video for intros/outros.
+- **`subtitles.py --edl <edl.json> -o master.srt`** — smart subtitle generation. Styles: `bold-overlay`, `punch-word`, `natural`, `comedy`.
+- **`render.py <edl.json> -o <out>`** — parallel per-segment extract → concat → music mix → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles`. `--workers N`.
+- **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom. Default is auto per-clip analysis.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
 ## The process
 
-1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
+1. **Inventory.** `inventory.py` to classify takes vs memes vs music. `ffprobe` every source. `transcribe_batch.py` on main takes only. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
 2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
+3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, comedy/meme appetite, music vibe, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
 4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
 5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
 6. **Preview.** `render.py --preview`.
@@ -108,6 +116,103 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
+
+## Comedy, memes, and music (when the material calls for it)
+
+These are taste calls — but when the user wants energy, humor, or a music bed, here's what works.
+
+### Reading comedy from the transcript
+
+Audio events are your best signal: `(laughs)`, `(applause)`, `(sighs)`. In comedy/vlog content:
+- **Extend past punchlines** — include the laugh beat; the reaction IS the payoff.
+- **Cut on the inhale** before a new bit, not mid-word.
+- **Preserve stumbles that land** — a genuine "wait what" often beats a clean take.
+- **Flag meme moments** in the strategy: quote the line + timestamp + suggested meme from `inventory.json` meme_pool.
+
+### Meme / reaction inserts
+
+Users drop clips into `memes/` or prefix with `meme_`. Insert as EDL ranges — same as any other source:
+
+```json
+{"source": "meme_brain_expanding", "start": 0, "end": 2.1,
+ "type": "meme", "beat": "REACTION", "keep_audio": true,
+ "reason": "After 'that's insane' at 0:34 — brain-expanding meme lands the joke"}
+```
+
+Rules of thumb:
+- **Timing:** cut TO the meme on the beat word, or 100–200ms after for comedic pause.
+- **Duration:** memes are accents. 1–3s typical. Trim dead air at head/tail.
+- **Audio:** `keep_audio: true` for sound memes (default). `false` to mute and keep dialogue bed.
+- **Don't over-insert.** One well-placed meme beats five random ones. Ask the user if they have favorites in the folder.
+- **Match energy** — deadpan line → subtle reaction gif; hype moment → loud vine.
+
+### Background music
+
+Users drop tracks in `music/` or root as `.mp3`/`.wav`. Reference in EDL:
+
+```json
+"music": {
+  "file": "music/lofi_beat.mp3",
+  "volume": 0.22,
+  "fade_in": 1.0,
+  "fade_out": 2.0,
+  "duck_on_speech": true
+}
+```
+
+- **Volume 0.15–0.30** under dialogue. Louder only in montage sections with no speech.
+- **Duck on speech** (default on) — music dips when someone talks.
+- **Genre should match vibe** — lo-fi for chill vlogs, upbeat for comedy, cinematic for travel.
+- Propose music in the strategy if files exist in `inventory.json` music_pool.
+
+## Intro & outro sequences (music-led montages)
+
+Intros and outros are **music-first**: source clips are muted, your track drives the audio, and cuts snap to beats. Text cards land on key beats.
+
+### Workflow
+
+1. **Drop music** in `music/` (e.g. `music/intro_beat.mp3`)
+2. **Detect beats:** `beats.py music/intro_beat.mp3 --end 12 -o edit/beats_intro.json`
+3. **Build sequence:** `build_sequence.py --beats edit/beats_intro.json --sources broll_1 broll_2 --type intro --music music/intro_beat.mp3 --titles "MY CHANNEL" -o edit/intro_block.json`
+4. **Merge into EDL** — the `intro` / `outro` blocks sit alongside main `ranges`:
+
+```json
+{
+  "sources": { "C0103": "...", "broll_1": "...", "broll_2": "..." },
+  "intro": {
+    "music": { "file": "music/intro_beat.mp3", "start": 0, "volume": 1.0 },
+    "ranges": [
+      {"source": "broll_1", "start": 0, "end": 0.52, "type": "intro", "beat": "INTRO_1"},
+      {"source": "broll_2", "start": 0, "end": 0.48, "type": "intro", "beat": "INTRO_2"}
+    ],
+    "titles": [
+      {"text": "MY CHANNEL", "at": 0.0, "duration": 1.5},
+      {"text": "EPISODE 12", "at": 2.1, "duration": 1.2, "subtitle": "the one where we fix it"}
+    ]
+  },
+  "ranges": [ ... main talking-head content ... ],
+  "outro": {
+    "music": { "file": "music/outro_beat.mp3", "start": 0, "volume": 1.0 },
+    "ranges": [ ... beat-synced b-roll cuts ... ],
+    "titles": [{"text": "SUBSCRIBE", "at": 0.5, "duration": 2.0}]
+  }
+}
+```
+
+5. **Render:** `render.py` flattens intro → main → outro, mutes source audio in intro/outro segments, replaces with music slices, auto-generates title card overlays.
+
+### Beat-sync rules
+
+- **One clip per beat segment** — duration = time between consecutive beats from `beats.json`
+- **`--every 2`** on `beats.py` for half-tempo (slower, cinematic) cuts
+- **B-roll cycles** — if 3 clips and 8 beats, clips repeat in order
+- **Title cards** on beat 0 (channel name), beat 4 (episode title), outro beat 1 (CTA)
+- **Grade:** use `vibrant_social` or `cinematic_cool` for montage sections; `auto_consistent` across the full video
+- **No subtitles** in intro/outro by default (music-led, no speech) — titles ARE the text
+
+### Title cards
+
+`title_card.py "MY SHOW" -o edit/titles/intro.mp4` — or let render auto-generate from EDL `titles` arrays. Orange accent underline, fade in/out. For custom branding, build a HyperFrames/Remotion slot instead.
 
 ## The packed transcript (primary reading view)
 
@@ -165,34 +270,43 @@ Your job is to **reason about the image**, not apply a preset. Look at a frame (
 
 Mental model is ASC CDL. Per channel: `out = (in * slope + offset) ** power`, then global saturation. `slope` → highlights, `offset` → shadows, `power` → midtones.
 
-**Example filter chains** (`grade.py` has `--list-presets`; use them as starting points or mix your own):
+**Grade modes in EDL `grade` field:**
+- **`auto`** (default) — per-segment subtle correction from frame analysis. Best when lighting varies between takes.
+- **`auto_consistent`** — one unified grade across all segments. Best when cuts should feel seamless (interviews, single-location vlogs).
+- **Preset name** — uniform creative look.
+- **Raw ffmpeg filter** — full control.
 
-- **`warm_cinematic`** — retro/technical, subtle teal/orange split, desaturated. Shipped in a real launch video. Safe for talking heads.
+**Presets** (`grade.py --list-presets`):
+
+- **`subtle`** — barely perceptible cleanup. Safe default floor.
 - **`neutral_punch`** — minimal corrective: contrast bump + gentle S-curve. No hue shifts.
-- **`none`** — straight copy. Default when the user hasn't asked.
+- **`warm_cinematic`** — retro/technical, subtle teal/orange split, desaturated. Talking heads.
+- **`vibrant_social`** — punchy, slightly warm, lifted shadows. Vlogs, social, reaction content.
+- **`comedy_bright`** — bright, clean, skin-safe. Podcasts, comedy, well-lit indoor.
+- **`cinematic_cool`** — subtle teal shadows, warm highlights. Travel, documentary.
+- **`none`** — straight copy.
 
-For anything else — portraiture, nature, product, music video, documentary — invent your own chain. `grade.py --filter '<raw ffmpeg>'` accepts any filter string.
+For anything else — portraiture, nature, product, music video — invent your own chain. `grade.py --filter '<raw ffmpeg>'` accepts any filter string.
 
-Hard rules: apply **per-segment during extraction** (not post-concat, which re-encodes twice). Never go aggressive without testing skin tones.
+Hard rules: apply **per-segment during extraction** (not post-concat). Never go aggressive without testing skin tones. For comedy/social, prefer `vibrant_social` or `comedy_bright` over `warm_cinematic` (which crushes saturation).
 
 ## Subtitles (when requested)
 
-Subtitles have three dimensions worth reasoning about: **chunking** (1/2/3/sentence per line), **case** (UPPER/Title/Natural), and **placement** (margin from bottom). The right combo depends on content.
+Subtitles have four dimensions: **chunking**, **case**, **emphasis**, and **placement**. The right combo depends on content. Use `subtitles.py` or `render.py --build-subtitles` with `subtitle_style` in the EDL.
 
-**Worked styles** — pick, adapt, or invent:
+**Styles** — pick based on content, not habit:
 
-**`bold-overlay`** — short-form tech launch, fast-paced social. 2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `render.py` ships with this as `SUB_FORCE_STYLE`.
+**`bold-overlay`** — short-form tech launch, fast social. 2–3 word chunks, UPPERCASE, break on punctuation. Tight timing.
 
-```
-FontName=Helvetica,FontSize=18,Bold=1,
-PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,
-BorderStyle=1,Outline=2,Shadow=0,
-Alignment=2,MarginV=35
-```
+**`punch-word`** — highlights the most important word per phrase in yellow (ASS override). Great for hooks, key stats, comedy punchlines. Use when one word per line should pop.
 
-**`natural-sentence`** (if you invent this mode) — narrative, documentary, education. 4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font for readability, slightly wider max-width. No shipped force_style — design one if you need it.
+**`natural`** — documentary, education, longer-form. 4–8 word chunks, sentence case, readable pauses. Larger font, semi-transparent background.
 
-Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
+**`comedy`** — reaction-friendly. Shorter chunks around `(laughs)` and emphasis words. UPPERCASE on punchlines, normal pacing elsewhere. Pair with meme inserts.
+
+Set in EDL: `"subtitle_style": "punch-word"` or pass `--subtitle-style comedy` to render.py.
+
+Invent a custom style if none fit. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5), MarginV ≥ 75 on vertical video (platform safe zone).
 
 ## Animations (when requested)
 
@@ -270,14 +384,24 @@ Match the source unless the user asked for something specific. Common targets: `
 ```json
 {
   "version": 1,
-  "sources": {"C0103": "/abs/path/C0103.MP4", "C0108": "/abs/path/C0108.MP4"},
+  "sources": {
+    "C0103": "/abs/path/C0103.MP4",
+    "meme_brain": "/abs/path/memes/brain_expanding.mp4"
+  },
   "ranges": [
     {"source": "C0103", "start": 2.42, "end": 6.85,
-     "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
-    {"source": "C0108", "start": 14.30, "end": 28.90,
-     "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start."}
+     "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery."},
+    {"source": "meme_brain", "start": 0, "end": 2.1,
+     "type": "meme", "beat": "REACTION", "keep_audio": true,
+     "reason": "Lands after 'that's insane' punchline."}
   ],
-  "grade": "warm_cinematic",
+  "grade": "auto_consistent",
+  "subtitle_style": "punch-word",
+  "music": {
+    "file": "music/lofi.mp3",
+    "volume": 0.22,
+    "duck_on_speech": true
+  },
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
   ],
@@ -286,7 +410,7 @@ Match the source unless the user asked for something specific. Common targets: `
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+`grade` is a preset name, `auto`, `auto_consistent`, or raw ffmpeg filter. Range `type` can be `take` (default), `meme`, `insert`, or `broll`. `overlays` are rendered animation clips. `music` is optional background bed. `subtitles` applied LAST.
 
 ## Memory — `project.md`
 

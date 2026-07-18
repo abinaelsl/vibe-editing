@@ -2,18 +2,23 @@
   <img src="static/video-use-banner.png" alt="video-use" width="100%">
 </p>
 
-# video-use
+# Vibe Editing
 
-Introducing **video-use** — edit videos with Claude Code. 100% open source.
+**by [@abinaelsl](https://github.com/abinaelsl)**
 
-Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works for any content — talking heads, montages, tutorials, travel, interviews — without presets or menus.
+Conversation-driven video editing with AI. Drop raw footage in a folder, chat with your agent, get `final.mp4` back. Works for talking heads, comedy, montages, tutorials, travel, interviews — without presets or menus.
+
+> Forked from [browser-use/video-use](https://github.com/browser-use/video-use) with meme inserts, smart subtitles, beat-synced intros/outros, and music-led sequences.
 
 ## What it does
 
 - **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes
-- **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain)
+- **Auto color grades** every segment — per-clip analysis, consistent mode, or creative presets (`vibrant_social`, `comedy_bright`, etc.)
+- **Meme & reaction inserts** — drop clips in `memes/`, insert on punchlines with sound
+- **Background music** with speech ducking — drop tracks in `music/`
+- **Smart subtitles** — `punch-word`, `comedy`, `natural`, or classic `bold-overlay` styles
 - **30ms audio fades** at every cut so you never hear a pop
-- **Burns subtitles** in your style — 2-word UPPERCASE chunks by default, fully customizable
+- **Beat-synced intro/outro** — music-led montages with cuts on beats, title cards, and your track as the only audio
 - **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation
 - **Self-evaluates the rendered output** at every cut boundary before showing you anything
 - **Persists session memory** in `project.md` so next week's session picks up where you left off
@@ -23,7 +28,7 @@ Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works
 Paste into Claude Code, Codex, Hermes, Openclaw, or any agent with shell access:
 
 ```text
-Set up https://github.com/browser-use/video-use for me.
+Set up https://github.com/abinaelsl/vibe-editing for me.
 
 Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and set up the ElevenLabs API key — ask me to paste it when you need it. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
@@ -51,12 +56,12 @@ If you'd rather do it by hand:
 
 ```bash
 # 1. Clone and symlink into your agent's skills directory
-git clone https://github.com/browser-use/video-use ~/Developer/video-use
-ln -sfn ~/Developer/video-use ~/.claude/skills/video-use        # Claude Code
-# ln -sfn ~/Developer/video-use ~/.codex/skills/video-use       # Codex
+git clone https://github.com/abinaelsl/vibe-editing ~/Developer/vibe-editing
+ln -sfn ~/Developer/vibe-editing ~/.claude/skills/vibe-editing        # Claude Code
+# ln -sfn ~/Developer/vibe-editing ~/.codex/skills/vibe-editing       # Codex
 
 # 2. Install deps
-cd ~/Developer/video-use
+cd ~/Developer/vibe-editing
 uv sync                         # or: pip install -e .
 brew install ffmpeg             # required
 brew install yt-dlp             # optional, for downloading online sources
