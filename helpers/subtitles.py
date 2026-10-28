@@ -266,7 +266,11 @@ def build_master_srt(
     transcripts_dir = edit_dir / "transcripts"
 
     entries: list[tuple[float, float, str]] = []
-    seg_offset = 0.0
+    # Main-body ranges render after the intro block in the flattened output
+    # (intro -> ranges -> outro), so caption offsets must start past it —
+    # otherwise every cue lands `intro_duration` seconds too early.
+    intro_ranges = edl.get("intro", {}).get("ranges", [])
+    seg_offset = sum(float(r["end"]) - float(r["start"]) for r in intro_ranges)
 
     for r in edl["ranges"]:
         src_name = r["source"]
@@ -310,6 +314,24 @@ def build_master_srt(
         seg_offset += seg_duration
 
     entries.sort(key=lambda e: e[0])
+
+    # "natural" style: a fast talker's chunk can be timing-accurate (matches
+    # exactly how long those words took to say) but still unreadable — 8 words
+    # said in 1.2s is 6.7 words/sec, well past comfortable reading pace. Extend
+    # such cues' display time toward a target reading rate, capped so they never
+    # eat into the next cue's start (the PNG-overlay pipeline plays cues back to
+    # back, not overlapped).
+    if style == "natural":
+        TARGET_WPS = 3.0
+        GAP_BUFFER = 0.05
+        for i, (a, b, t) in enumerate(entries):
+            nwords = len(t.split())
+            needed_end = a + (nwords / TARGET_WPS)
+            cap = entries[i + 1][0] - GAP_BUFFER if i + 1 < len(entries) else needed_end
+            new_b = max(b, min(needed_end, cap))
+            if new_b > b:
+                entries[i] = (a, new_b, t)
+
     lines: list[str] = []
     for i, (a, b, t) in enumerate(entries, start=1):
         lines.append(str(i))

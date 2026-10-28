@@ -58,3 +58,10 @@ master.srt
 takes_packed.md
 edl.json
 project.md
+
+# Raw footage folders for edit projects
+venture pitch and grand seiko/
+*.MP4
+*.mp4
+*.MOV
+*.mov

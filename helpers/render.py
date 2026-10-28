@@ -483,9 +483,15 @@ def mix_music_bed(
       file          — path to audio (mp3/wav/m4a)
       volume        — music level 0.0-1.0 (default 0.22)
       start_at      — when music starts in output timeline (default 0)
+      end_at        — when music stops in output timeline (default: end of video)
       fade_in       — seconds (default 1.0)
       fade_out      — seconds (default 2.0)
       duck_on_speech — lower music under dialogue (default true)
+
+    start_at/end_at scope the bed to a window (e.g. one act of a multi-act
+    video); outside that window the track is silent. Multiple scoped beds
+    can be layered by calling this repeatedly, feeding each output back in
+    as the next call's base_path.
     """
     music_path = resolve_path(music_spec["file"], edit_dir)
     if not music_path.exists():
@@ -505,21 +511,31 @@ def mix_music_bed(
         stderr=subprocess.DEVNULL,
     )
     duration = float(dur_out.decode().strip())
-    fade_out_start = max(0.0, duration - fade_out)
 
-    # Loop/trim music to match video length, apply volume + fades
+    start_at = max(0.0, float(music_spec.get("start_at", 0.0)))
+    end_at = float(music_spec.get("end_at", duration))
+    end_at = min(end_at, duration)
+    seg_dur = max(0.0, end_at - start_at)
+    fade_out_start = max(0.0, seg_dur - fade_out)
+    delay_ms = int(round(start_at * 1000))
+
+    # Loop/trim music to the scoped window, apply volume + fades, then
+    # shift it out to start_at so it lines up with the base timeline.
     music_chain = (
-        f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{duration:.3f},"
+        f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{seg_dur:.3f},"
         f"volume={volume},"
         f"afade=t=in:st=0:d={fade_in},"
-        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out}[music]"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out},"
+        f"adelay={delay_ms}|{delay_ms}[music]"
     )
 
     if duck:
-        # Sidechain compress music against dialogue — music dips when speech is loud
+        # Sidechain compress music against dialogue — music dips when speech is loud.
+        # sidechaincompress compresses its FIRST input, keyed by its SECOND input,
+        # so the music must be first and the base audio (dialogue) second.
         filter_complex = (
             f"{music_chain};"
-            f"[0:a][music]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=200:makeup=1[ducked];"
+            f"[music][0:a]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=200:makeup=1[ducked];"
             f"[0:a][ducked]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
     else:
@@ -536,7 +552,8 @@ def mix_music_bed(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"music mix → {out_path.name} (vol={volume}, duck={'on' if duck else 'off'})")
+    print(f"music mix → {out_path.name} (vol={volume}, duck={'on' if duck else 'off'}, "
+          f"window={start_at:.1f}-{end_at:.1f}s)")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -774,6 +791,7 @@ def build_final_composite(
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
+        "-shortest",
         str(out_path),
     ]
     print(f"compositing → {out_path.name}")
@@ -867,11 +885,16 @@ def main() -> None:
         apply_music_sections(base_path, music_sections, edit_dir, sections_out)
         base_path = sections_out
 
-    # 2c. Optional background music bed under dialogue (main body)
+    # 2c. Optional background music bed(s) under dialogue (main body).
+    # A single dict applies wall-to-wall; a list of dicts (each with its own
+    # start_at/end_at) layers multiple scoped beds (e.g. one per act).
     music_spec = edl.get("music")
-    if music_spec and music_spec.get("file"):
-        music_out = edit_dir / base_name.replace(".mp4", "_music.mp4")
-        mix_music_bed(base_path, music_spec, edit_dir, music_out, preview=args.preview)
+    music_beds = music_spec if isinstance(music_spec, list) else ([music_spec] if music_spec else [])
+    for bed_idx, bed in enumerate(music_beds):
+        if not bed or not bed.get("file"):
+            continue
+        music_out = edit_dir / base_name.replace(".mp4", f"_music{bed_idx}.mp4")
+        mix_music_bed(base_path, bed, edit_dir, music_out, preview=args.preview)
         base_path = music_out
 
     # 3. Subtitles: build if requested, resolve final path + style
